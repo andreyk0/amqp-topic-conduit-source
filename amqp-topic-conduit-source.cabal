@@ -30,7 +30,7 @@ library
   ghc-options:       -Wall
 
 
-executable example
+executable amqp-topic-conduit-source-example
   hs-source-dirs:      example
 
   main-is:             Main.hs
