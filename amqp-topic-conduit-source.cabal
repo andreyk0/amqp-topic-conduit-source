@@ -23,6 +23,7 @@ library
                      , amqp
                      , conduit
                      , monad-logger
+                     , resourcet
                      , template-haskell
                      , text
                      , transformers
@@ -43,7 +44,7 @@ executable amqp-topic-conduit-source-example
                      , conduit
                      , monad-logger
                      , mtl
+                     , resourcet
                      , text
-                     , transformers-base
 
   ghc-options:       -Wall
