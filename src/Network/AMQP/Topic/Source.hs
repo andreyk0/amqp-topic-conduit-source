@@ -17,6 +17,7 @@ module Network.AMQP.Topic.Source (
 
 import           Control.Concurrent
 import qualified Control.Exception as CE
+import           Control.Monad
 import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           Control.Monad.Logger
 import           Control.Monad.Trans.Class
@@ -105,7 +106,7 @@ sourceEventsL lg uri rKey = do
         chan <- openChannel conn
 
         addChannelExceptionHandler chan
-          ( \(e::CE.SomeException) ->
+          ( \(CE.SomeException e) ->
                esLog lg LevelError $ "AMQP Exception in channel: " <> (T.pack.show) e )
 
         -- declare a queue, exchange and binding
@@ -128,7 +129,7 @@ sourceEventsL lg uri rKey = do
         case maybeConn
           of Just conn -> do esLog lg LevelWarn "Closing AMQP connection ..."
                              CE.catch (closeConnection conn)
-                                      (\(e::CE.SomeException) -> esLog lg LevelError $ "Failed to close AMQP connection: " <> (T.pack . show) e)
+                                      (\(CE.SomeException e) -> esLog lg LevelError $ "Failed to close AMQP connection: " <> (T.pack . show) e)
              Nothing   -> return ()
         _ <- liftIO $ tryTakeMVar sourceMV -- just in case msg handler callback is blocked there
         return ()
@@ -141,11 +142,11 @@ sourceEventsL lg uri rKey = do
                             (do closeLastOpenConnection
                                 esLog lg LevelWarn "Shutting down AMQP event loop ..." ) )
 
-                      (\(e::CE.SomeException) -> do esLog lg LevelError $ "Caught AMQP error: " <> (T.pack . show) e <> ", sleeping ..."
-                                                    closeLastOpenConnection
-                                                    threadDelay (5 * 1000000)
-                                                    _ <- tryPutMVar keepRunningMV True -- try to continue running but don't force it, source may have already closed
-                                                    loop)
+                      (\(CE.SomeException e) -> do esLog lg LevelError $ "Caught AMQP error: " <> (T.pack . show) e <> ", sleeping ..."
+                                                   closeLastOpenConnection
+                                                   threadDelay (5 * 1000000)
+                                                   void $ tryPutMVar keepRunningMV True -- try to continue running but don't force it, source may have already closed
+                                                   loop)
 
   _ <- liftIO $ forkIO loop
 
