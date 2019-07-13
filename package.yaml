@@ -1,0 +1,35 @@
+name: amqp-topic-conduit-source
+version: '0.1.0.0'
+synopsis: Represents AMQP topic as an infinite Conduit Source of messages.
+description: Please see README.md
+category: Network
+author: Andrey Kartashov
+maintainer: andrey.kartashov@gmail.com
+copyright: 2016 Andrey Kartashov
+license: BSD3
+
+dependencies:
+- amqp
+- base
+- conduit
+- resourcet
+- rio
+- text
+- unliftio
+
+library:
+  source-dirs: src
+  ghc-options: -Wall
+  exposed-modules:
+  - Network.AMQP.Topic.Source
+  dependencies:
+  - template-haskell
+  - transformers
+
+executables:
+  amqp-topic-conduit-source-example:
+    main: Main.hs
+    source-dirs: example
+    ghc-options: -Wall
+    dependencies:
+    - amqp-topic-conduit-source

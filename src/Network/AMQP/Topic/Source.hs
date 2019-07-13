@@ -1,153 +1,123 @@
-{-# LANGUAGE OverloadedStrings     #-}
-{-# LANGUAGE ScopedTypeVariables   #-}
-{-# LANGUAGE TemplateHaskell       #-}
+{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 
-module Network.AMQP.Topic.Source (
-  AmqpURI
-, EventSourceLogger(..)
-, ExchangeKey
-, noopEventSourceLogger
-, sourceEvents
-, sourceEventsL
-, sourceEventsML
-, stderrEventSourceLogger
-) where
+module Network.AMQP.Topic.Source
+  ( AmqpURI
+  , ExchangeKey
+  , sourceEventsC
+  , sourceEventsMv
+  ) where
 
 
-import           Control.Concurrent
-import qualified Control.Exception as CE
-import           Control.Monad
-import           Control.Monad.IO.Class (MonadIO, liftIO)
-import           Control.Monad.Logger
-import           Control.Monad.Trans.Class
-import           Control.Monad.Trans.Resource
-import           Data.Conduit as C
+import           Data.Conduit             as C
 import qualified Data.Conduit.Combinators as C
-import           Data.Text (Text)
-import qualified Data.Text as T
-import qualified Data.Text.IO as TIO
-import           Language.Haskell.TH.Syntax (qLocation)
 import           Network.AMQP
-import           System.IO (stderr)
+import           RIO
+import           UnliftIO.Concurrent
+import           UnliftIO.Resource
 
 
 type ExchangeKey = Text
 type AmqpURI = String
 
--- | Log in the IO monad.
-newtype EventSourceLogger = EventSourceLogger
-  {
-    esLog:: LogLevel -> Text -> IO ()
-  }
-
--- | Don't log anything
-noopEventSourceLogger:: EventSourceLogger
-noopEventSourceLogger =
-  EventSourceLogger $ \_ _ -> return ()
-
--- | Log to stderr
-stderrEventSourceLogger:: EventSourceLogger
-stderrEventSourceLogger =
-  EventSourceLogger $ \lvl msg ->
-    TIO.hPutStrLn stderr $ (T.pack.show) lvl <> ": " <> msg
 
 
--- | Handles reconnections to AMQP server, abstracts an AMQP topic as an infinite
---   source of events.
--- Logs to stderr.
-sourceEvents:: (Monad m, MonadIO m, MonadResource m)
-            => AmqpURI -- ^ e.g. "amqp://guest:guest@localhost:5672/"
-            -> ExchangeKey -- ^ e.g. ".some.topic.#"
-            -> ConduitT () (Message,Envelope) m ()
-sourceEvents = sourceEventsL stderrEventSourceLogger
+{- | Handles reconnections to AMQP server, abstracts an AMQP topic as an infinite
+     source of events wrapped into a Conduit.
+-}
+sourceEventsC
+  :: ( Monad m
+     , MonadUnliftIO m
+     , MonadIO m
+     , MonadReader env m
+     , MonadResource m
+     , HasLogFunc env
+     )
+  => AmqpURI -- ^ e.g. "amqp://guest:guest@localhost:5672/"
+  -> ExchangeKey -- ^ e.g. ".some.topic.#"
+  -> ConduitT () (Message,Envelope) m ()
+sourceEventsC uri rKey = do
+  srcMv <- lift $ sourceEventsMv uri rKey
+  C.repeatM $ takeMVar srcMv
 
 
--- | Handles reconnections to AMQP server, abstracts an AMQP topic as an infinite
---   source of events.
--- Logs with MonadLogger.
-sourceEventsML:: (Monad m, MonadIO m, MonadResource m, MonadLoggerIO m)
-              => AmqpURI -- ^ e.g. "amqp://guest:guest@localhost:5672/"
-              -> ExchangeKey -- ^ e.g. ".some.topic.#"
-              -> ConduitT () (Message,Envelope) m ()
-sourceEventsML uri rKey = do
-  mllg <- lift askLoggerIO
-  let lg = EventSourceLogger $ \lvl msg -> mllg $(qLocation >>= liftLoc) "sourceEventsML" lvl (toLogStr msg)
-  sourceEventsL lg uri rKey
 
+{- | Handles reconnections to AMQP server, abstracts an AMQP topic as an infinite
+     source of events shared via an MVar.
+-}
+sourceEventsMv
+  :: ( Monad m
+     , MonadUnliftIO m
+     , MonadIO m
+     , MonadReader env m
+     , MonadResource m
+     , HasLogFunc env
+     )
+  => AmqpURI -- ^ e.g. "amqp://guest:guest@localhost:5672/"
+  -> ExchangeKey -- ^ e.g. ".some.topic.#"
+  -> m (MVar (Message,Envelope))
+sourceEventsMv uri rKey = do
 
--- | Handles reconnections to AMQP server, abstracts an AMQP topic as an infinite
---   source of events.
--- Takes logger implementation.
-sourceEventsL:: (Monad m, MonadIO m, MonadResource m)
-             => EventSourceLogger
-             -> AmqpURI -- ^ e.g. "amqp://guest:guest@localhost:5672/"
-             -> ExchangeKey -- ^ e.g. ".some.topic.#"
-             -> ConduitT () (Message,Envelope) m ()
-sourceEventsL lg uri rKey = do
-
-  sourceMV <- liftIO newEmptyMVar
+  sourceMV <- newEmptyMVar
   (_, keepRunningMV) <- allocate (newMVar True) (`putMVar` False)
-  lastOpenConnection <- liftIO newEmptyMVar
+  lastOpenConnection <- newEmptyMVar
 
   let ifM c t e = do x <- c; if x then t else e
 
-  let connectToAMQPServer = do
-        esLog lg LevelDebug "Attempting to connect to AMQP host ..."
-        conn <- openConnection'' $ fromURI uri
+  let connectToAMQPServer = withRunInIO $ \rio -> do
+        rio $ logDebug "Attempting to connect to AMQP host ..."
+        conn <- liftIO $ openConnection'' $ fromURI uri
         putMVar lastOpenConnection conn
-        esLog lg LevelDebug "Successfully connected to AMQP host."
+        rio $ logDebug "Successfully connected to AMQP host."
 
         addConnectionClosedHandler conn True $ do
-          esLog lg LevelWarn "AMQP connection closed."
-          _ <- tryPutMVar keepRunningMV True -- try to continue running but don't force it, source may have already closed
-          return ()
+          rio $ logWarn "AMQP connection closed."
+          void $ tryPutMVar keepRunningMV True -- try to continue running but don't force it, source may have already closed
 
         chan <- openChannel conn
 
         addChannelExceptionHandler chan
-          ( \(CE.SomeException e) ->
-               esLog lg LevelError $ "AMQP Exception in channel: " <> (T.pack.show) e )
+          ( \(SomeException e) -> rio $ logError . display $ "AMQP Exception in channel: " <> tshow e )
 
         -- declare a queue, exchange and binding
         (qName, _, _) <- declareQueue chan newQueue { queueExclusive = True, queueAutoDelete = True }
 
-        esLog lg LevelInfo $ "Binding to AMQP queue " <> qName
+        rio $ logInfo . display $ "Binding to AMQP queue " <> qName
         bindQueue chan qName "amq.topic" rKey
 
-        esLog lg LevelInfo $ "Subscribing to AMQP queue " <> qName
+        rio $ logInfo . display $ "Subscribing to AMQP queue " <> qName
 
-        _ <- consumeMsgs chan qName Ack $ \me@(_,env) -> do
-               putMVar sourceMV me
-               ackEnv env
+        void $ consumeMsgs chan qName Ack $ \me@(_,env) -> do
+          putMVar sourceMV me
+          ackEnv env
 
-        esLog lg LevelDebug "Handling AMQP events ..."
+        rio $ logDebug "Handling AMQP events ..."
 
 
   let closeLastOpenConnection = do
         maybeConn <- tryTakeMVar lastOpenConnection
         case maybeConn
-          of Just conn -> do esLog lg LevelWarn "Closing AMQP connection ..."
-                             CE.catch (closeConnection conn)
-                                      (\(CE.SomeException e) -> esLog lg LevelError $ "Failed to close AMQP connection: " <> (T.pack . show) e)
-             Nothing   -> return ()
-        _ <- liftIO $ tryTakeMVar sourceMV -- just in case msg handler callback is blocked there
-        return ()
+          of Just conn -> do logWarn  "Closing AMQP connection ..."
+                             catch (liftIO $ closeConnection conn)
+                                   (\(SomeException e) -> logError . display $ "Failed to close AMQP connection: " <> tshow e)
+             Nothing   -> pure ()
+        void $ tryTakeMVar sourceMV -- just in case msg handler callback is blocked there
 
 
-  let loop = CE.catch ( ifM (takeMVar keepRunningMV)
+  let loop = catch ( ifM (takeMVar keepRunningMV)
                             (do closeLastOpenConnection
                                 connectToAMQPServer
                                 loop)
                             (do closeLastOpenConnection
-                                esLog lg LevelWarn "Shutting down AMQP event loop ..." ) )
+                                logWarn "Shutting down AMQP event loop ..." ) )
 
-                      (\(CE.SomeException e) -> do esLog lg LevelError $ "Caught AMQP error: " <> (T.pack . show) e <> ", sleeping ..."
-                                                   closeLastOpenConnection
-                                                   threadDelay (5 * 1000000)
-                                                   void $ tryPutMVar keepRunningMV True -- try to continue running but don't force it, source may have already closed
-                                                   loop)
+                   (\(SomeException e) -> do
+                       logError . display $ "Caught AMQP error: " <> tshow e <> ", sleeping ..."
+                       closeLastOpenConnection
+                       threadDelay (5 * 1000000)
+                       void $ tryPutMVar keepRunningMV True -- try to continue running but don't force it, source may have already closed
+                       loop)
 
-  _ <- liftIO $ forkIO loop
-
-  C.repeatM $ liftIO $ takeMVar sourceMV
+  void $ forkIO loop
+  pure sourceMV
