@@ -67,7 +67,8 @@ sourceEventsMv uri rKey = do
 
   let connectToAMQPServer = withRunInIO $ \rio -> do
         rio $ logDebug "Attempting to connect to AMQP host ..."
-        conn <- liftIO $ openConnection'' $ fromURI uri
+        connInfo <- fromEither $ first stringException $ fromURI uri
+        conn <- liftIO $ openConnection'' connInfo
         putMVar lastOpenConnection conn
         rio $ logDebug "Successfully connected to AMQP host."
 
